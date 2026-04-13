@@ -1,2 +1,6 @@
-.venv
-README.md
+.venv/
+datasus.db
+baixados/parciais/
+__pycache__/
+*.pyc
+debug_page_*.html
