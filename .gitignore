@@ -4,3 +4,4 @@ baixados/parciais/
 __pycache__/
 *.pyc
 debug_page_*.html
+README.md
