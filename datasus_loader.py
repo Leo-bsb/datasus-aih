@@ -17,17 +17,26 @@ DB_PATH = Path("datasus.db")
 MESES_PT = {'jan':1,'fev':2,'mar':3,'abr':4,'mai':5,'jun':6,
             'jul':7,'ago':8,'set':9,'out':10,'nov':11,'dez':12}
 
-RE_PERIODO = re.compile(r'^(jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez)[/\-_](\d{4})$',
-                        re.IGNORECASE)
+# DATASUS gera colunas no formato AAAA/Mmm  ex: 2024/Jan  2025/Dez
+RE_PERIODO = re.compile(
+    r'^(\d{4})[/\-_](jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez)$',
+    re.IGNORECASE)
 
 def is_periodo_col(col: str) -> bool:
-    """Retorna True se o nome da coluna parece um período (Jan/2024, Fev/2025...)."""
     return bool(RE_PERIODO.match(col.strip()))
 
 def parse_periodo(texto):
-    m = RE_PERIODO.match(str(texto).strip())
+    """Retorna (mes, ano) de strings como '2024/Jan' ou 'Jan/2024'."""
+    s = str(texto).strip()
+    # Formato DATASUS: AAAA/Mmm
+    m = RE_PERIODO.match(s)
     if m:
-        return MESES_PT.get(m.group(1).lower(), 0), int(m.group(2))
+        return MESES_PT.get(m.group(2).lower(), 0), int(m.group(1))
+    # Formato alternativo: Mmm/AAAA
+    m2 = re.match(r'^(jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez)[/\-_](\d{4})$',
+                  s, re.IGNORECASE)
+    if m2:
+        return MESES_PT.get(m2.group(1).lower(), 0), int(m2.group(2))
     return None, None
 
 def to_float(v):
@@ -74,15 +83,35 @@ def criar_banco(conn):
 
 
 def processar_csv(path: Path) -> pd.DataFrame:
-    try:
-        df = pd.read_csv(path, sep=';', dtype=str, encoding='utf-8-sig',
-                         on_bad_lines='skip')
-    except Exception:
-        df = pd.read_csv(path, sep=';', dtype=str, encoding='latin-1',
-                         on_bad_lines='skip')
+    # Detectar separador real lendo a primeira linha
+    raw_line = None
+    for enc in ('utf-8-sig', 'utf-8', 'latin-1'):
+        try:
+            with open(path, encoding=enc) as f:
+                raw_line = f.readline()
+            break
+        except Exception:
+            continue
+
+    sep = ';' if raw_line and raw_line.count(';') >= raw_line.count(',') else ','
+
+    for enc in ('utf-8-sig', 'utf-8', 'latin-1'):
+        try:
+            df = pd.read_csv(path, sep=sep, dtype=str, encoding=enc,
+                             on_bad_lines='skip')
+            break
+        except Exception:
+            continue
+    else:
+        raise ValueError(f"Nao foi possivel ler {path}")
 
     df.columns = [c.strip() for c in df.columns]
     col0 = df.columns[0]  # sempre Município
+
+    # Debug: mostrar primeiras colunas para diagnóstico
+    outras = [c for c in df.columns if c != col0]
+    print(f"\n    sep={sep!r} | {len(df.columns)} colunas | "
+          f"ex: {outras[:3]}")
 
     # Remover rodapé
     df = df[~df[col0].fillna('').str.strip().str.lower()
@@ -99,10 +128,15 @@ def processar_csv(path: Path) -> pd.DataFrame:
 
     if periodo_cols:
         # Formato A: Município × períodos  (novo scraper)
-        # Cada coluna é um período (Jan/2024, Fev/2024...) — sem subgrupo
-        # O subgrupo_procedimento fica como 'Todos' pois não está discriminado
-        print(f"    formato: wide-período ({len(periodo_cols)} períodos)")
-        df_long = df.melt(id_vars=[col0], value_vars=periodo_cols,
+        # Filtrar apenas os períodos alvo (2024/Jan a 2026/Jan)
+        ANOS_ALVO = {2024, 2025, 2026}
+        periodo_cols_alvo = [
+            c for c in periodo_cols
+            if parse_periodo(c)[1] in ANOS_ALVO
+        ]
+        print(f"    formato: wide-período ({len(periodo_cols)} total, "
+              f"{len(periodo_cols_alvo)} no intervalo alvo)")
+        df_long = df.melt(id_vars=[col0], value_vars=periodo_cols_alvo,
                           var_name='periodo', value_name='valor')
         df_long = df_long.rename(columns={col0: 'municipio'})
         df_long['subgrupo_procedimento'] = 'Todos os subgrupos'
@@ -125,7 +159,19 @@ def processar_csv(path: Path) -> pd.DataFrame:
     df_long['mes'] = parsed[0].astype('Int64')
     df_long['ano'] = parsed[1].astype('Int64')
 
-    df_long = df_long[df_long['valor'].notna() & df_long['mes'].notna()]
+    # Normalizar periodo para formato legível: Jan/2024
+    MESES_NOME = {1:'Jan',2:'Fev',3:'Mar',4:'Abr',5:'Mai',6:'Jun',
+                  7:'Jul',8:'Ago',9:'Set',10:'Out',11:'Nov',12:'Dez'}
+    df_long['periodo'] = df_long.apply(
+        lambda r: f"{MESES_NOME.get(r['mes'], '?')}/{r['ano']}"
+                  if pd.notna(r['mes']) and pd.notna(r['ano']) else r['periodo'],
+        axis=1
+    )
+
+    df_long = df_long[df_long['valor'].notna() & df_long['mes'].notna() & (df_long['valor'] > 0)]
+
+    # Manter apenas o intervalo de interesse: 2024 a 2026
+    df_long = df_long[df_long['ano'].isin([2024, 2025, 2026])]
 
     cols = ['municipio','subgrupo_procedimento','periodo','mes','ano','tipo','valor']
     return df_long[[c for c in cols if c in df_long.columns]]
